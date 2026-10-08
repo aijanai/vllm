@@ -138,7 +138,28 @@ __global__ void __launch_bounds__(kFusedThreads, 1)
   #pragma unroll
     for (int m = 0; m < kFusedMaxM; ++m) acc[m] = 0.f;
     const T* wrow = w + static_cast<size_t>(row) * K;
-    for (int k = lane * VEC; k < K; k += 32 * VEC) {
+    // Keep kUnroll 16-byte weight loads in flight per lane: at M <= 8 the
+    // GEMV is bound by memory latency, not by the FMAs.
+    constexpr int kUnroll = 4;
+    constexpr int kStep = 32 * VEC;
+    int k = lane * VEC;
+    for (; k + (kUnroll - 1) * kStep < K; k += kUnroll * kStep) {
+      P wv[kUnroll];
+  #pragma unroll
+      for (int u = 0; u < kUnroll; ++u)
+        wv[u] = *reinterpret_cast<const P*>(wrow + k + u * kStep);
+      for (int m = 0; m < M; ++m) {
+        const T* xrow = x + static_cast<size_t>(m) * K + k;
+  #pragma unroll
+        for (int u = 0; u < kUnroll; ++u) {
+          P xv = *reinterpret_cast<const P*>(xrow + u * kStep);
+  #pragma unroll
+          for (int v = 0; v < VEC; ++v)
+            acc[m] += upcast_s(wv[u].data[v]) * upcast_s(xv.data[v]);
+        }
+      }
+    }
+    for (; k < K; k += kStep) {
       P wv = *reinterpret_cast<const P*>(wrow + k);
       for (int m = 0; m < M; ++m) {
         P xv = *reinterpret_cast<const P*>(x + static_cast<size_t>(m) * K + k);
