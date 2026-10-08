@@ -551,9 +551,24 @@ class CustomAllreduce:
     FUSED_GEMV_MAX_M = 8
 
     def should_fuse_gemv_allreduce(self, x: torch.Tensor, weight: torch.Tensor) -> bool:
-        if self.disabled or self.world_size not in (2, 4, 8):
+        if self.disabled:
+            logger.warning_once(
+                "VLLM_FUSED_GEMV_ALLREDUCE=1 but the custom all-reduce is "
+                "disabled (no GPU P2P between ranks, or disabled explicitly): "
+                "fused GEMV+all-reduce is OFF, falling back to GEMM + NCCL. "
+                "Check `nvidia-smi topo -p2p r` and "
+                "torch.cuda.can_device_access_peer()."
+            )
             return False
-        if not (self.world_size == 2 or self.fully_connected):
+        if self.world_size not in (2, 4, 8) or not (
+            self.world_size == 2 or self.fully_connected
+        ):
+            logger.warning_once(
+                "VLLM_FUSED_GEMV_ALLREDUCE=1 but the topology is unsupported "
+                "(world size %d, fully_connected=%s): fused GEMV+all-reduce is OFF.",
+                self.world_size,
+                self.fully_connected,
+            )
             return False
         if x.dtype not in (torch.float16, torch.bfloat16) or x.dtype != weight.dtype:
             return False
