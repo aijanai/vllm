@@ -154,8 +154,11 @@ __global__ void __launch_bounds__(kFusedThreads, 1)
         acc[m] += __shfl_xor_sync(0xffffffff, acc[m], o);
     }
     if (lane == 0) {
+      // Bias is folded into this rank's partial (the caller passes it on one
+      // rank only, as RowParallelLinear does), so the sum carries it once.
+      const float b = bias != nullptr ? upcast_s(bias[row]) : 0.f;
       for (int m = 0; m < M; ++m)
-        self_part[static_cast<size_t>(m) * N + row] = downcast_s<T>(acc[m]);
+        self_part[static_cast<size_t>(m) * N + row] = downcast_s<T>(acc[m] + b);
     }
     // Publish this tile to the peers, then wait for theirs.
     __syncthreads();
@@ -183,7 +186,6 @@ __global__ void __launch_bounds__(kFusedThreads, 1)
             reinterpret_cast<const char*>(dp.ptrs[g]) + parity * partial_bytes);
         s += upcast_s(part[static_cast<size_t>(m) * N + r]);
       }
-      if (bias != nullptr) s += upcast_s(bias[r]);
       out[static_cast<size_t>(m) * N + r] = downcast_s<T>(s);
     }
   }
