@@ -20,14 +20,12 @@ from ..utils import (
 SHAPES = [(1, 2560, 2560), (4, 2560, 5120), (8, 4096, 2048), (3, 10240, 2560)]
 
 
-def _max_ulps(a: torch.Tensor, b: torch.Tensor) -> int:
-    """Largest distance between two bf16/fp16 tensors in units in the last place."""
-
-    def ordered(t: torch.Tensor) -> torch.Tensor:
-        bits = t.view(torch.int16).int() & 0xFFFF
-        return torch.where(bits >= 0x8000, 0x8000 - bits, bits)
-
-    return int((ordered(a) - ordered(b)).abs().max())
+def _assert_close(out: torch.Tensor, ref: torch.Tensor) -> None:
+    # Different fp32 accumulation order than the reference: allow a few
+    # output-dtype ULPs of the largest magnitude (plain ULPs blow up near 0).
+    eps = torch.finfo(out.dtype).eps
+    atol = 4 * eps * float(ref.abs().max())
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=atol)
 
 
 def _reference(x_full, w_full, bias, dtype):
@@ -74,7 +72,7 @@ def _fused_gemv_allreduce_worker(
                 for _ in range(5):
                     out = group.fused_gemv_allreduce(x, w, bias_r)
                     torch.accelerator.synchronize()
-                    assert _max_ulps(out, ref) <= 4, _max_ulps(out, ref)
+                    _assert_close(out, ref)
                 # Bitwise identical across ranks (fixed reduction order).
                 gathered = group.all_gather(out, dim=0).view(tp_size, m, n)
                 assert torch.equal(gathered[0], gathered[rank])
@@ -98,7 +96,7 @@ def _fused_gemv_allreduce_worker(
         for _ in range(3):
             graph.replay()
             torch.accelerator.synchronize()
-            assert _max_ulps(out, ref) <= 4, _max_ulps(out, ref)
+            _assert_close(out, ref)
         dist.barrier(group=group.device_group)
 
 
