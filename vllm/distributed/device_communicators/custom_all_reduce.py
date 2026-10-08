@@ -334,6 +334,7 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
+        self._fused_gemv_ready = False
         self._ptr = ops.init_custom_ar(
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
@@ -545,6 +546,51 @@ class CustomAllreduce:
             ops.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
+
+    # ---- fused GEMV + all-reduce (decode) ---------------------------------
+    FUSED_GEMV_MAX_M = 8
+
+    def should_fuse_gemv_allreduce(self, x: torch.Tensor, weight: torch.Tensor) -> bool:
+        if self.disabled or self.world_size not in (2, 4, 8):
+            return False
+        if not (self.world_size == 2 or self.fully_connected):
+            return False
+        if x.dtype not in (torch.float16, torch.bfloat16) or x.dtype != weight.dtype:
+            return False
+        if x.dim() != 2 or weight.dim() != 2 or not x.is_contiguous():
+            return False
+        if not weight.is_contiguous():
+            return False
+        m, k = x.shape
+        n = weight.shape[0]
+        if (
+            m < 1
+            or m > self.FUSED_GEMV_MAX_M
+            or n % 8 != 0
+            or k % (16 // x.element_size()) != 0
+        ):
+            return False
+        # two partial regions + flags must fit in the registered buffer
+        return 2 * m * n * x.element_size() + 65536 <= self.max_size
+
+    def fused_gemv_allreduce(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Compute all_reduce(x @ weight.T) + bias in one kernel (see csrc)."""
+        if not self._fused_gemv_ready:
+            # Flags live at the tail of the registered buffer and must start
+            # at zero on every rank before anyone signals a peer.
+            ops.fused_gemv_allreduce_reset(
+                self._ptr, self.buffer_ptrs[self.rank], self.max_size, self.device.index
+            )
+            torch.accelerator.synchronize(self.device)
+            dist.barrier(group=self.group)
+            self._fused_gemv_ready = True
+        out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+        ops.fused_gemv_allreduce(
+            self._ptr, x, weight, bias, out, self.buffer_ptrs[self.rank], self.max_size
+        )
+        return out
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""

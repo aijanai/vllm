@@ -1,6 +1,7 @@
 #pragma once
 
 #include "custom_collective_common.cuh"
+#include <algorithm>
 
 namespace vllm {
 
@@ -73,6 +74,121 @@ __global__ void __launch_bounds__(512, 1)
     }
   }
 }
+
+#ifndef USE_ROCM
+// ---------------------------------------------------------------------------
+// Fused GEMV + all-reduce for TP decode (M <= kFusedMaxM rows).
+//
+// y = x @ W^T summed over TP ranks, in one kernel per rank: each block
+// computes a tile of partial rows, publishes it into its own IPC-registered
+// buffer, signals the peers (one flag per block per rank, release/acquire),
+// then waits for the peers' tiles and reduces them in a fixed rank order so
+// every rank produces bitwise identical output. No separate all-reduce
+// kernel, no stream-level barrier. Partial regions alternate by call parity
+// so call n+1 never overwrites what a lagging peer may still read of call n
+// (a peer can be at most one call behind: it must pass our flags of call n
+// to finish call n, and it finishes call n before it starts n+1).
+//
+// Buffer layout per rank (reg_buffer of size reg_buffer_sz):
+//   [parity 0 partials][parity 1 partials] ... [flags][call counters]
+// flags:    FlagType[kFusedMaxBlocks][kMaxCustomCollectiveRanks], written by
+//           peers (release), read by owner (acquire).
+// counters: FlagType[kFusedMaxBlocks], owner only; parity and flag base.
+// ---------------------------------------------------------------------------
+constexpr int kFusedMaxM = 8;
+constexpr int kFusedMaxBlocks = 256;
+constexpr int kFusedThreads = 256;
+constexpr int kFusedRowsPerIter = kFusedThreads / 32;  // one W row per warp
+constexpr size_t kFusedFlagsBytes =
+    sizeof(FlagType) * kFusedMaxBlocks * (kMaxCustomCollectiveRanks + 1);
+
+template <typename T, int ngpus>
+__global__ void __launch_bounds__(kFusedThreads, 1)
+    fused_gemv_allreduce_kernel(RankData* _dp, const T* __restrict__ x,
+                                const T* __restrict__ w,
+                                const T* __restrict__ bias, T* __restrict__ out,
+                                int M, int N, int K, int rank,
+                                size_t partial_bytes, size_t flags_off) {
+  using P = typename packed_t<T>::P;
+  constexpr int VEC = P::size;
+  auto dp = *_dp;
+  char* self_base = reinterpret_cast<char*>(const_cast<void*>(dp.ptrs[rank]));
+  FlagType* self_flags = reinterpret_cast<FlagType*>(self_base + flags_off);
+  FlagType* counters = self_flags + kFusedMaxBlocks * kMaxCustomCollectiveRanks;
+
+  __shared__ uint32_t s_call;
+  if (threadIdx.x == 0) {
+    uint32_t c = counters[blockIdx.x] + 1;
+    counters[blockIdx.x] = c;
+    s_call = c;
+  }
+  __syncthreads();
+  const uint32_t call = s_call;
+  const int parity = call & 1;
+  const int tiles = N / kFusedRowsPerIter;
+  const int tiles_per_block = (tiles + gridDim.x - 1) / gridDim.x;
+  const uint32_t base = call * tiles_per_block;
+  T* self_part = reinterpret_cast<T*>(self_base + parity * partial_bytes);
+  const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+
+  int it = 0;
+  for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x, ++it) {
+    const int row = tile * kFusedRowsPerIter + warp;
+    float acc[kFusedMaxM];
+  #pragma unroll
+    for (int m = 0; m < kFusedMaxM; ++m) acc[m] = 0.f;
+    const T* wrow = w + static_cast<size_t>(row) * K;
+    for (int k = lane * VEC; k < K; k += 32 * VEC) {
+      P wv = *reinterpret_cast<const P*>(wrow + k);
+      for (int m = 0; m < M; ++m) {
+        P xv = *reinterpret_cast<const P*>(x + static_cast<size_t>(m) * K + k);
+  #pragma unroll
+        for (int v = 0; v < VEC; ++v)
+          acc[m] += upcast_s(wv.data[v]) * upcast_s(xv.data[v]);
+      }
+    }
+  #pragma unroll
+    for (int m = 0; m < kFusedMaxM; ++m) {
+  #pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        acc[m] += __shfl_xor_sync(0xffffffff, acc[m], o);
+    }
+    if (lane == 0) {
+      for (int m = 0; m < M; ++m)
+        self_part[static_cast<size_t>(m) * N + row] = downcast_s<T>(acc[m]);
+    }
+    // Publish this tile to the peers, then wait for theirs.
+    __syncthreads();
+    const uint32_t seq = base + it + 1;
+    if (threadIdx.x < ngpus && threadIdx.x != rank) {
+      FlagType* peer_flags = reinterpret_cast<FlagType*>(
+          reinterpret_cast<char*>(const_cast<void*>(dp.ptrs[threadIdx.x])) +
+          flags_off);
+      st_flag_release(
+          &peer_flags[blockIdx.x * kMaxCustomCollectiveRanks + rank], seq);
+      while (
+          ld_flag_acquire(&self_flags[blockIdx.x * kMaxCustomCollectiveRanks +
+                                      threadIdx.x]) != seq);
+    }
+    __syncthreads();
+    // Reduce the tile in fixed rank order (bitwise identical on all ranks).
+    for (int idx = threadIdx.x; idx < kFusedRowsPerIter * M;
+         idx += blockDim.x) {
+      const int m = idx / kFusedRowsPerIter;
+      const int r = tile * kFusedRowsPerIter + idx % kFusedRowsPerIter;
+      float s = 0.f;
+  #pragma unroll
+      for (int g = 0; g < ngpus; ++g) {
+        const T* part = reinterpret_cast<const T*>(
+            reinterpret_cast<const char*>(dp.ptrs[g]) + parity * partial_bytes);
+        s += upcast_s(part[static_cast<size_t>(m) * N + r]);
+      }
+      if (bias != nullptr) s += upcast_s(bias[r]);
+      out[static_cast<size_t>(m) * N + r] = downcast_s<T>(s);
+    }
+  }
+}
+#endif  // !USE_ROCM
 
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
@@ -345,6 +461,78 @@ class CustomAllreduce {
                                      Signal* local_signal,
                                      Signal* multicast_signal, int size,
                                      int block_limit);
+
+  // Fused GEMV + all-reduce; see fused_gemv_allreduce_kernel. reg_buffer must
+  // be the IPC-registered buffer of this rank (register_buffer).
+  template <typename T>
+  void fused_gemv_allreduce(cudaStream_t stream, const T* x, const T* w,
+                            const T* bias, T* out, int M, int N, int K,
+                            void* reg_buffer, size_t reg_buffer_sz) {
+#ifdef USE_ROCM
+    throw std::runtime_error("fused_gemv_allreduce is not supported on ROCm");
+#else
+    using P = typename packed_t<T>::P;
+    if (M < 1 || M > kFusedMaxM)
+      throw std::runtime_error("fused_gemv_allreduce: M must be in [1, " +
+                               std::to_string(kFusedMaxM) + "]");
+    if (N % kFusedRowsPerIter != 0 || K % P::size != 0)
+      throw std::runtime_error(
+          "fused_gemv_allreduce: N must be a multiple of " +
+          std::to_string(kFusedRowsPerIter) + " and K of " +
+          std::to_string(P::size));
+    auto it = buffers_.find(reg_buffer);
+    if (it == buffers_.end())
+      throw std::runtime_error(
+          "fused_gemv_allreduce: reg_buffer is not registered");
+    RankData* ptrs = it->second;
+    const size_t partial_bytes =
+        ((static_cast<size_t>(M) * N * sizeof(T)) + 127) & ~size_t(127);
+    if (reg_buffer_sz < kFusedFlagsBytes + 256)
+      throw std::runtime_error("fused_gemv_allreduce: buffer too small");
+    const size_t flags_off = (reg_buffer_sz - kFusedFlagsBytes) & ~size_t(127);
+    if (2 * partial_bytes > flags_off)
+      throw std::runtime_error(
+          "fused_gemv_allreduce: M*N too large for the registered buffer");
+    int dev = 0, sms = 0;
+    CUDACHECK(cudaGetDevice(&dev));
+    CUDACHECK(
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    const int tiles = N / kFusedRowsPerIter;
+    // All blocks must be co-resident on every rank: a block only waits on
+    // its peer block of the same index, so grid <= #SMs keeps it deadlock-free.
+    const int blocks = std::min({tiles, kFusedMaxBlocks, sms});
+  #define FUSED_KL(ngpus)                       \
+    fused_gemv_allreduce_kernel<T, ngpus>       \
+        <<<blocks, kFusedThreads, 0, stream>>>( \
+            ptrs, x, w, bias, out, M, N, K, rank_, partial_bytes, flags_off)
+    switch (world_size_) {
+      case 2:
+        FUSED_KL(2);
+        break;
+      case 4:
+        FUSED_KL(4);
+        break;
+      case 8:
+        FUSED_KL(8);
+        break;
+      default:
+        throw std::runtime_error(
+            "fused_gemv_allreduce supports world sizes 2, 4 and 8");
+    }
+  #undef FUSED_KL
+#endif
+  }
+
+  // Zero the flag/counter region of this rank's buffer. All ranks must call
+  // this (and barrier) before the first fused_gemv_allreduce.
+  void fused_gemv_allreduce_reset(cudaStream_t stream, void* reg_buffer,
+                                  size_t reg_buffer_sz) {
+    if (reg_buffer_sz < kFusedFlagsBytes + 256)
+      throw std::runtime_error("fused_gemv_allreduce_reset: buffer too small");
+    const size_t flags_off = (reg_buffer_sz - kFusedFlagsBytes) & ~size_t(127);
+    CUDACHECK(cudaMemsetAsync(static_cast<char*>(reg_buffer) + flags_off, 0,
+                              reg_buffer_sz - flags_off, stream));
+  }
 
   ~CustomAllreduce() {
     for (auto [_, ptr] : ipc_handles_) {

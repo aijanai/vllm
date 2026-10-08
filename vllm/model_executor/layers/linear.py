@@ -15,6 +15,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
@@ -237,6 +238,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         ):
             return linear_batch_invariant(x, layer.weight, bias)
         return self._gemm_impl(layer, x, layer.weight, bias)
+
+    def apply_fused_allreduce(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        # bf16/fp16 weights only; everything else keeps GEMM + all_reduce.
+        if envs.VLLM_BATCH_INVARIANT or x.dim() != 2:
+            return None
+        tp_group = get_tp_group()
+        if not tp_group.can_fuse_gemv_allreduce(x, layer.weight):
+            return None
+        return tp_group.fused_gemv_allreduce(x, layer.weight, bias)
 
 
 class LinearBase(PluggableLayer):
@@ -1775,12 +1790,19 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
-
-        if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
-        else:
-            output = output_parallel
+        output = None
+        if self.reduce_results and self.tp_size > 1 and envs.VLLM_FUSED_GEMV_ALLREDUCE:
+            # GEMV with the all-reduce in its epilogue: one kernel, no
+            # separate collective. None means "not fusable", fall through.
+            output = self.quant_method.apply_fused_allreduce(
+                self, input_parallel, bias_
+            )
+        if output is None:
+            output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+            if self.reduce_results and self.tp_size > 1:
+                output = tensor_model_parallel_all_reduce(output_parallel)
+            else:
+                output = output_parallel
 
         if not self.return_bias:
             return output

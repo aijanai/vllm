@@ -57,6 +57,19 @@ class QuantizeMethodBase(ABC):
         raise NotImplementedError
 
     # Not required functions
+    def apply_fused_allreduce(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor | None:
+        """Row-parallel GEMM with the TP all-reduce fused into the epilogue.
+
+        Return None when the method has no fused path for this input; the
+        layer then runs apply() followed by the regular all-reduce."""
+        return None
+
+    # Not required functions
     def embedding(self, layer: torch.nn.Module, *args, **kwargs) -> torch.Tensor:
         """Gather embeddings in the layer based on indices in the input tensor.
 

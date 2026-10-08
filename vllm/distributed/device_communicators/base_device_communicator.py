@@ -250,6 +250,13 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def fused_gemv_allreduce(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """all_reduce(x @ weight.T) + bias in one kernel, or None when this
+        communicator has no fused path (the caller falls back)."""
+        return None
+
     def checkpoint_prepare(self) -> None:
         """Prepare reclaimable communicator state for checkpoint (default: no-op)."""
 

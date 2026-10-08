@@ -115,6 +115,65 @@ void all_reduce(fptr_t _fa, torch::stable::Tensor& inp,
   }
 }
 
+void fused_gemv_allreduce(fptr_t _fa, torch::stable::Tensor& x,
+                          torch::stable::Tensor& weight,
+                          std::optional<torch::stable::Tensor> bias,
+                          torch::stable::Tensor& out, fptr_t _reg_buffer,
+                          int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      x.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(x.get_device_index());
+  STD_TORCH_CHECK(x.dim() == 2 && weight.dim() == 2 && out.dim() == 2);
+  STD_TORCH_CHECK(x.scalar_type() == weight.scalar_type() &&
+                  x.scalar_type() == out.scalar_type());
+  STD_TORCH_CHECK(x.is_contiguous() && weight.is_contiguous() &&
+                  out.is_contiguous());
+  const int64_t M = x.size(0), K = x.size(1), N = weight.size(0);
+  STD_TORCH_CHECK(weight.size(1) == K);
+  STD_TORCH_CHECK(out.size(0) == M && out.size(1) == N);
+  const void* bias_ptr = nullptr;
+  if (bias.has_value()) {
+    STD_TORCH_CHECK(bias->scalar_type() == x.scalar_type());
+    STD_TORCH_CHECK(bias->numel() == N && bias->is_contiguous());
+    bias_ptr = bias->const_data_ptr();
+  }
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  switch (x.scalar_type()) {
+    case torch::headeronly::ScalarType::Half:
+      fa->fused_gemv_allreduce<half>(
+          stream, reinterpret_cast<const half*>(x.const_data_ptr()),
+          reinterpret_cast<const half*>(weight.const_data_ptr()),
+          reinterpret_cast<const half*>(bias_ptr),
+          reinterpret_cast<half*>(out.mutable_data_ptr()), M, N, K, reg_buffer,
+          reg_buffer_sz_bytes);
+      break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case torch::headeronly::ScalarType::BFloat16:
+      fa->fused_gemv_allreduce<nv_bfloat16>(
+          stream, reinterpret_cast<const nv_bfloat16*>(x.const_data_ptr()),
+          reinterpret_cast<const nv_bfloat16*>(weight.const_data_ptr()),
+          reinterpret_cast<const nv_bfloat16*>(bias_ptr),
+          reinterpret_cast<nv_bfloat16*>(out.mutable_data_ptr()), M, N, K,
+          reg_buffer, reg_buffer_sz_bytes);
+      break;
+#endif
+    default:
+      throw std::runtime_error(
+          "fused_gemv_allreduce only supports float16 and bfloat16");
+  }
+}
+
+void fused_gemv_allreduce_reset(fptr_t _fa, fptr_t _reg_buffer,
+                                int64_t reg_buffer_sz_bytes,
+                                int64_t device_index) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const torch::stable::accelerator::DeviceGuard device_guard(device_index);
+  const cudaStream_t stream = get_current_cuda_stream(device_index);
+  fa->fused_gemv_allreduce_reset(stream, reinterpret_cast<void*>(_reg_buffer),
+                                 reg_buffer_sz_bytes);
+}
+
 void dispose(fptr_t _fa) {
   delete reinterpret_cast<vllm::CustomAllreduce*>(_fa);
 }

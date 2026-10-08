@@ -205,6 +205,22 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def fused_gemv_allreduce(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, group_name: str
+) -> torch.Tensor:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_gemv_allreduce_out_place(x, weight, bias)
+
+
+def fused_gemv_allreduce_fake(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, group_name: str
+) -> torch.Tensor:
+    return torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
+
+
 def reduce_scatter(
     tensor: torch.Tensor, dim: int, world_size: int, group_name: str
 ) -> torch.Tensor:
@@ -397,6 +413,12 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_gemv_allreduce",
+    op_func=fused_gemv_allreduce,
+    fake_impl=fused_gemv_allreduce_fake,
 )
 
 direct_register_custom_op(
@@ -741,6 +763,39 @@ class GroupCoordinator:
             return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
         else:
             return self._all_reduce_out_place(input_)
+
+    def can_fuse_gemv_allreduce(self, x: torch.Tensor, weight: torch.Tensor) -> bool:
+        """Whether fused_gemv_allreduce would run fused for this shape (the
+        caller must otherwise take the GEMM + all_reduce path)."""
+        comm = self.device_communicator
+        ca = getattr(comm, "ca_comm", None)
+        return (
+            self.world_size > 1
+            and ca is not None
+            and not ca.disabled
+            and ca.should_fuse_gemv_allreduce(x, weight)
+        )
+
+    def fused_gemv_allreduce(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """all_reduce(x @ weight.T) + bias in one kernel; only valid when
+        can_fuse_gemv_allreduce(x, weight) is True."""
+        if self.use_custom_op_call:
+            return torch.ops.vllm.fused_gemv_allreduce(
+                x, weight, bias, group_name=self.unique_name
+            )
+        return self._fused_gemv_allreduce_out_place(x, weight, bias)
+
+    def _fused_gemv_allreduce_out_place(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        out = self.device_communicator.fused_gemv_allreduce(x, weight, bias)
+        if out is None:
+            raise ValueError("fused_gemv_allreduce is not available for this shape")
+        return out
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:

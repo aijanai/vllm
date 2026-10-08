@@ -357,6 +357,20 @@ class CudaCommunicator(DeviceCommunicatorBase):
             scope="global",
         )
 
+    def fused_gemv_allreduce(
+        self, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """all_reduce(x @ weight.T) + bias fused in one kernel, or None when the
+        custom all-reduce peers cannot serve this shape (caller falls back)."""
+        ca_comm = self.ca_comm
+        if (
+            ca_comm is None
+            or ca_comm.disabled
+            or not ca_comm.should_fuse_gemv_allreduce(x, weight)
+        ):
+            return None
+        return ca_comm.fused_gemv_allreduce(x, weight, bias)
+
     def all_reduce(self, input_):
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (

@@ -3113,6 +3113,28 @@ def all_reduce(
     torch.ops._C_custom_ar.all_reduce(fa, inp, out, reg_buffer, reg_buffer_sz_bytes)
 
 
+def fused_gemv_allreduce(
+    fa: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+) -> None:
+    torch.ops._C_custom_ar.fused_gemv_allreduce(
+        fa, x, weight, bias, out, reg_buffer, reg_buffer_sz_bytes
+    )
+
+
+def fused_gemv_allreduce_reset(
+    fa: int, reg_buffer: int, reg_buffer_sz_bytes: int, device_index: int
+) -> None:
+    torch.ops._C_custom_ar.fused_gemv_allreduce_reset(
+        fa, reg_buffer, reg_buffer_sz_bytes, device_index
+    )
+
+
 def custom_all_gather(
     fa: int,
     inp: torch.Tensor,
