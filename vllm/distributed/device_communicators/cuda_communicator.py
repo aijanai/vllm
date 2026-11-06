@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 
 import torch
 from torch.distributed import ProcessGroup
@@ -205,6 +206,18 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
 
+        # Experimental two-level LL all-reduce for PCIe GPUs that span CPU sockets;
+        # off on one socket, where dispatch falls through to FlashInfer PCIe IPC / NCCL.
+        self.ll_ar = None
+        if self.world_size > 1 and os.environ.get("VLLM_LL_AR_ENABLE", "0") == "1":
+            from .ll_allreduce import LLAllReduce
+
+            self.ll_ar = LLAllReduce(
+                self.cpu_group, self.device, self.rank_in_group, self.world_size
+            )
+            if self.ll_ar.disabled:
+                self.ll_ar = None
+
         if self.use_all2all:
             if self.all2all_backend in ("naive", "allgather_reducescatter"):
                 from .all2all import AgRsAll2AllManager
@@ -382,6 +395,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        if self.ll_ar is not None:
+            out = self.ll_ar.all_reduce(input_)
+            if out is not None:
+                return out
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
